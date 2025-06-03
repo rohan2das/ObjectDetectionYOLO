@@ -41,4 +41,5 @@ Thumbs.db
 *.pt
 
 /myenv
+/newenv
 /weights

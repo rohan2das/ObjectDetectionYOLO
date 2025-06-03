@@ -9,6 +9,8 @@ import time
 import numpy as np
 from datetime import datetime
 import torch
+import mss
+import pygetwindow as gw
 
 def fileuploader(uploaded_file):
     """
@@ -140,6 +142,148 @@ def convert_video_to_mp4(input_path):
     os.system(f'ffmpeg -i {input_path} -vcodec libx264 {output_path} -y')
     return output_path
 
+def get_available_windows():
+    """Get list of available windows for capture."""
+    try:
+        windows = gw.getAllWindows()
+        window_list = []
+        for window in windows:
+            if window.title and window.title.strip() and window.visible:
+                window_info = {
+                    'title': window.title,
+                    'left': window.left,
+                    'top': window.top,
+                    'width': window.width,
+                    'height': window.height
+                }
+                window_list.append(window_info)
+        return window_list
+    except Exception as e:
+        st.error(f"Error getting windows: {e}")
+        return []
+
+def get_available_monitors():
+    """Get list of available monitors."""
+    try:
+        with mss.mss() as sct:
+            monitors = sct.monitors[1:]  # Skip the "All in One" monitor
+            return monitors
+    except Exception as e:
+        st.error(f"Error getting monitors: {e}")
+        return []
+
+def capture_screen_area(monitor_info=None, window_info=None):
+    """
+    Capture screen area (monitor or window).
+    
+    Args:
+        monitor_info: Monitor information dict
+        window_info: Window information dict
+    
+    Returns:
+        numpy array: Captured image as BGR array
+    """
+    try:
+        with mss.mss() as sct:
+            if window_info:
+                # Capture specific window
+                capture_area = {
+                    "top": window_info['top'],
+                    "left": window_info['left'],
+                    "width": window_info['width'],
+                    "height": window_info['height']
+                }
+            elif monitor_info:
+                # Capture specific monitor
+                capture_area = monitor_info
+            else:
+                # Capture primary monitor
+                capture_area = sct.monitors[1]
+            
+            # Capture the screen
+            screenshot = sct.grab(capture_area)
+            
+            # Convert to PIL Image
+            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            
+            # Convert to numpy array (BGR format for OpenCV)
+            img_array = np.array(img)
+            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            
+            return img_bgr
+            
+    except Exception as e:
+        st.error(f"Error capturing screen: {e}")
+        return None
+
+def screen_capture_detection():
+    """Screen capture detection interface."""
+    st.header("Screen Capture Detection")
+    
+    # Capture type selection
+    capture_type = st.selectbox(
+        "Choose capture type:",
+        ["Select Monitor", "Select Window", "Custom Area"]
+    )
+    
+    if capture_type == "Select Monitor":
+        monitors = get_available_monitors()
+        if monitors:
+            monitor_options = []
+            for i, monitor in enumerate(monitors):
+                monitor_options.append(f"Monitor {i+1} ({monitor['width']}x{monitor['height']})")
+            
+            selected_monitor_idx = st.selectbox("Choose monitor:", range(len(monitor_options)), 
+                                              format_func=lambda x: monitor_options[x])
+            selected_monitor = monitors[selected_monitor_idx]
+        else:
+            st.error("No monitors found")
+            return None, None
+            
+        return selected_monitor, None
+    
+    elif capture_type == "Select Window":
+        if st.button("Refresh Window List"):
+            st.session_state.windows_refreshed = True
+            
+        windows = get_available_windows()
+        if windows:
+            window_titles = [f"{w['title'][:50]}..." if len(w['title']) > 50 else w['title'] 
+                           for w in windows]
+            
+            selected_window_idx = st.selectbox("Choose window:", range(len(window_titles)),
+                                             format_func=lambda x: window_titles[x])
+            selected_window = windows[selected_window_idx]
+            
+            # Show window info
+            st.info(f"Selected: {selected_window['title']}")
+            st.write(f"Position: ({selected_window['left']}, {selected_window['top']})")
+            st.write(f"Size: {selected_window['width']} x {selected_window['height']}")
+            
+        else:
+            st.error("No windows found")
+            return None, None
+            
+        return None, selected_window
+    
+    else:  # Custom Area
+        st.write("Define custom capture area:")
+        col1, col2 = st.columns(2)
+        with col1:
+            left = st.number_input("Left", value=0, min_value=0)
+            top = st.number_input("Top", value=0, min_value=0)
+        with col2:
+            width = st.number_input("Width", value=800, min_value=1)
+            height = st.number_input("Height", value=600, min_value=1)
+        
+        custom_area = {
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height
+        }
+        return custom_area, None
+
 def app():
     # Page configuration
     st.set_page_config(page_title='Object Detection Web App', layout='wide')
@@ -155,7 +299,7 @@ def app():
     )
 
     # Load appropriate model
-    model_path = 'human_yolov8x.pt' if model_input == "Custom Trained YOLO" else 'yolov8x.pt'
+    model_path = 'human_yolov8n.pt' if model_input == "Custom Trained YOLO" else 'yolov8n.pt'
     try:
         model = YOLO(model_path)
     except Exception as e:
@@ -166,7 +310,7 @@ def app():
     object_names = list(model.names.values())
     detection_type = st.sidebar.selectbox(
         "Choose Detection Type", 
-        ["Image", "Video", "Webcam"]
+        ["Image", "Video", "Camera", "Screen Capture"]
     )
     selected_objects = st.sidebar.multiselect(
         'Choose objects to detect', 
@@ -248,7 +392,7 @@ def app():
         st.write("Starting real-time webcam detection. Click 'Stop' to end.")
         try:
             # Initialize webcam
-            cap = cv2.VideoCapture(0)
+            cap = cv2.VideoCapture(1)
             if not cap.isOpened():
                 raise ValueError("Could not open webcam")
                 
@@ -271,7 +415,7 @@ def app():
                     annotated_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                     
                     # Display the processed frame
-                    stframe.image(annotated_frame_rgb, channels="RGB", use_column_width=True)
+                    stframe.image(annotated_frame_rgb, channels="RGB", use_container_width=True)
                     
                     # Add small delay to prevent high CPU usage
                     time.sleep(0.01)
@@ -281,6 +425,70 @@ def app():
                 stframe.empty()
         except Exception as e:
             st.error(f"Error processing webcam feed: {str(e)}")
+    
+    elif detection_type == "Screen Capture":
+        monitor_info, window_info = screen_capture_detection()
+        
+        if monitor_info or window_info:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("Capture Once"):
+                    try:
+                        # Capture single frame
+                        frame = capture_screen_area(monitor_info, window_info)
+                        if frame is not None:
+                            # Process with YOLO
+                            annotated_frame = process_frame(frame, model, min_confidence, selected_objects)
+                            annotated_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                            st.image(annotated_frame_rgb, caption='Screen Capture Detection')
+                    except Exception as e:
+                        st.error(f"Error in screen capture: {e}")
+            
+            with col2:
+                if st.button("Start Real-time Capture"):
+                    st.session_state.screen_capture_running = True
+                if st.button("Stop Real-time Capture"):
+                    st.session_state.screen_capture_running = False
+            
+            # Real-time screen capture
+            if st.session_state.get('screen_capture_running', False):
+                stframe = st.empty()
+                fps_display = st.empty()
+                
+                try:
+                    fps_counter = 0
+                    start_time = time.time()
+                    
+                    while st.session_state.get('screen_capture_running', False):
+                        # Capture screen
+                        frame = capture_screen_area(monitor_info, window_info)
+                        
+                        if frame is not None:
+                            # Process with YOLO
+                            annotated_frame = process_frame(frame, model, min_confidence, selected_objects)
+                            annotated_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                            
+                            # Display frame
+                            stframe.image(annotated_frame_rgb, channels="RGB", use_container_width=True)
+                            
+                            # Calculate and display FPS
+                            fps_counter += 1
+                            if fps_counter % 10 == 0:  # Update FPS every 10 frames
+                                elapsed = time.time() - start_time
+                                fps = fps_counter / elapsed
+                                fps_display.write(f"FPS: {fps:.1f}")
+                        
+                        # Small delay to prevent excessive CPU usage
+                        time.sleep(0.1)  # Adjust for desired frame rate
+                        
+                except Exception as e:
+                    st.error(f"Error in real-time screen capture: {e}")
+                finally:
+                    if 'stframe' in locals():
+                        stframe.empty()
+                    if 'fps_display' in locals():
+                        fps_display.empty()
 
 if __name__ == "__main__":
     app()
