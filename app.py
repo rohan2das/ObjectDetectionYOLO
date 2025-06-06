@@ -12,6 +12,9 @@ import torch
 import mss
 import pygetwindow as gw
 
+# Fix for Streamlit + PyTorch compatibility issue
+os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
+
 def fileuploader(uploaded_file):
     """
     Handle file upload and save to temporary location.
@@ -187,6 +190,8 @@ def capture_screen_area(monitor_info=None, window_info=None):
         with mss.mss() as sct:
             if window_info:
                 # Capture specific window
+                w = gw.getWindowsWithTitle(window_info['title'])[0]
+                w.activate()
                 capture_area = {
                     "top": window_info['top'],
                     "left": window_info['left'],
@@ -335,6 +340,23 @@ def app():
                     annotated_frame = process_frame(frame, model, min_confidence, selected_objects)
                     annotated_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
                     st.image(annotated_frame_rgb, caption='Processed Image')
+                    # Save processed image for download
+                    processed_image_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
+                    cv2.imwrite(processed_image_path, annotated_frame)
+                    # Image to be included in the download
+                    with open(processed_image_path, 'rb') as img_file:
+                        img_bytes = img_file.read()
+                    # Get original filename without extension
+                    original_name = Path(uploaded_file.name).stem
+                    download_filename = f"{original_name}_processed.jpg"
+
+                    st.download_button(
+                        label="Download processed Image",
+                        data=img_bytes,
+                        file_name=download_filename,
+                        mime="image/jpeg"
+                    )
+
                 except Exception as e:
                     st.error(f"Error processing image: {str(e)}")
                 finally:
