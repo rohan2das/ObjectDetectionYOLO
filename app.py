@@ -9,8 +9,28 @@ import time
 import numpy as np
 from datetime import datetime
 import torch
-import mss
 import pygetwindow as gw
+
+# Windows-specific imports for direct window capture
+try:
+    import win32gui
+    import win32ui
+    import win32con
+    import win32api
+    from ctypes import windll
+    import ctypes
+    WINDOWS_AVAILABLE = True
+except ImportError:
+    WINDOWS_AVAILABLE = False
+    print("Windows API not available. Some features will be limited.")
+
+# Alternative: Using MSS for faster capture
+try:
+    import mss
+    MSS_AVAILABLE = True
+except ImportError:
+    MSS_AVAILABLE = False
+    print("MSS not available. Install with: pip install mss")
 
 # Fix for Streamlit + PyTorch compatibility issue
 os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
@@ -175,7 +195,7 @@ def get_available_monitors():
         st.error(f"Error getting monitors: {e}")
         return []
 
-def capture_screen_area(monitor_info=None, window_info=None):
+def capture_screen_area_mss(monitor_info=None, window_info=None):
     """
     Capture screen area (monitor or window).
     
@@ -221,6 +241,146 @@ def capture_screen_area(monitor_info=None, window_info=None):
         st.error(f"Error capturing screen: {e}")
         return None
 
+def capture_screen_area_win32(monitor_info=None, window_info=None):
+    """
+    Method 3: Windows API Direct Window Capture
+    - Can capture hidden/occluded windows on Windows
+    - Captures actual window content, not screen region
+    """
+    if not WINDOWS_AVAILABLE:
+        return None
+        
+    try:
+        # Try to find window by title (exact match first)
+        hwnd = win32gui.FindWindow(None, window_info['title'])
+        
+        # If exact match fails, search through all windows
+        if not hwnd:
+            def enum_windows_callback(hwnd, windows):
+                if win32gui.IsWindowVisible(hwnd):
+                    window_title = win32gui.GetWindowText(hwnd)
+                    if window_info['title'] in window_title or window_title in window_info['title']:
+                        windows.append(hwnd)
+                return True
+            
+            windows_list = []
+            win32gui.EnumWindows(enum_windows_callback, windows_list)
+            if windows_list:
+                hwnd = windows_list[0]
+            else:
+                print(f"Could not find window: {window_info['title']}")
+                return None
+        
+        # Get window dimensions
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        width = right - left
+        height = bottom - top
+        
+        if width <= 0 or height <= 0:
+            print(f"Invalid window dimensions: {width}x{height}")
+            return None
+        
+        # Method 3A: Using ctypes and PrintWindow (best for hidden windows)
+        try:
+            # Get window device context
+            hwnd_dc = win32gui.GetWindowDC(hwnd)
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            
+            # Create bitmap
+            save_bitmap = win32ui.CreateBitmap()
+            save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+            save_dc.SelectObject(save_bitmap)
+            
+            # Use ctypes to call PrintWindow
+            result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 3)
+            
+            if result == 0:
+                # PrintWindow failed, try BitBlt as fallback
+                print("PrintWindow failed, trying BitBlt...")
+                save_dc.BitBlt((0, 0), (width, height), mfc_dc, (0, 0), win32con.SRCCOPY)
+            
+            # Convert to numpy array
+            signed_ints_array = save_bitmap.GetBitmapBits(True)
+            img = np.frombuffer(signed_ints_array, dtype='uint8')
+            img.shape = (height, width, 4)
+            
+            # Clean up resources
+            win32gui.DeleteObject(save_bitmap.GetHandle())
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            
+            # Convert BGRA to BGR and handle potential issues
+            if img.size > 0:
+                bgr_img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                return bgr_img
+            else:
+                print("Empty image captured")
+                return None
+                
+        except Exception as inner_e:
+            print(f"PrintWindow method failed: {inner_e}")
+            # Try alternative method
+            return capture_method_3b_alternative(hwnd, width, height)
+            
+    except Exception as e:
+        print(f"Windows API capture error: {e}")
+        return None
+    
+def capture_method_3b_alternative(hwnd, width, height):
+    """Alternative Windows API method using different approach"""
+    try:
+        # Get device context differently
+        hdc = windll.user32.GetDC(hwnd)
+        if not hdc:
+            return None
+            
+        # Create compatible DC and bitmap
+        mdc = windll.gdi32.CreateCompatibleDC(hdc)
+        hbitmap = windll.gdi32.CreateCompatibleBitmap(hdc, width, height)
+        windll.gdi32.SelectObject(mdc, hbitmap)
+        
+        # Try different PrintWindow flags
+        # PW_CLIENTONLY = 1, PW_RENDERFULLCONTENT = 2, PW_CLIENTONLY | PW_RENDERFULLCONTENT = 3
+        success = windll.user32.PrintWindow(hwnd, mdc, 0)
+        
+        if not success:
+            # Fallback to BitBlt
+            windll.gdi32.BitBlt(mdc, 0, 0, width, height, hdc, 0, 0, win32con.SRCCOPY)
+        
+        # Get bitmap data
+        bmp_info = ctypes.create_string_buffer(40)  # BITMAPINFOHEADER size
+        ctypes.memset(bmp_info, 0, 40)
+        ctypes.c_uint32.from_buffer(bmp_info, 0).value = 40  # biSize
+        ctypes.c_int32.from_buffer(bmp_info, 4).value = width  # biWidth
+        ctypes.c_int32.from_buffer(bmp_info, 8).value = -height  # biHeight (negative for top-down)
+        ctypes.c_uint16.from_buffer(bmp_info, 12).value = 1  # biPlanes
+        ctypes.c_uint16.from_buffer(bmp_info, 14).value = 32  # biBitCount
+        
+        # Create buffer for image data
+        buffer_size = width * height * 4
+        image_buffer = ctypes.create_string_buffer(buffer_size)
+        
+        # Get the bitmap bits
+        windll.gdi32.GetDIBits(hdc, hbitmap, 0, height, image_buffer, bmp_info, 0)
+        
+        # Clean up
+        windll.gdi32.DeleteObject(hbitmap)
+        windll.gdi32.DeleteDC(mdc)
+        windll.user32.ReleaseDC(hwnd, hdc)
+        
+        # Convert to numpy array
+        img = np.frombuffer(image_buffer.raw, dtype='uint8')
+        img = img.reshape((height, width, 4))
+        
+        # Convert BGRA to BGR
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        
+    except Exception as e:
+        print(f"Alternative Windows capture failed: {e}")
+        return None
+
 def screen_capture_detection():
     """Screen capture detection interface."""
     st.header("Screen Capture Detection")
@@ -228,7 +388,7 @@ def screen_capture_detection():
     # Capture type selection
     capture_type = st.selectbox(
         "Choose capture type:",
-        ["Select Monitor", "Select Window", "Custom Area"]
+        ["Select Window", "Select Monitor"]
     )
     
     if capture_type == "Select Monitor":
@@ -271,23 +431,6 @@ def screen_capture_detection():
             
         return None, selected_window
     
-    else:  # Custom Area
-        st.write("Define custom capture area:")
-        col1, col2 = st.columns(2)
-        with col1:
-            left = st.number_input("Left", value=0, min_value=0)
-            top = st.number_input("Top", value=0, min_value=0)
-        with col2:
-            width = st.number_input("Width", value=800, min_value=1)
-            height = st.number_input("Height", value=600, min_value=1)
-        
-        custom_area = {
-            "left": left,
-            "top": top,
-            "width": width,
-            "height": height
-        }
-        return custom_area, None
 
 def app():
     # Page configuration
@@ -451,6 +594,11 @@ def app():
     elif detection_type == "Screen Capture":
         monitor_info, window_info = screen_capture_detection()
         
+        capture_method=st.selectbox(
+                "Choose capture method:",
+                ["win32api", "mss"]
+            )
+
         if monitor_info or window_info:
             col1, col2 = st.columns(2)
             
@@ -458,7 +606,7 @@ def app():
                 if st.button("Capture Once"):
                     try:
                         # Capture single frame
-                        frame = capture_screen_area(monitor_info, window_info)
+                        frame = capture_screen_area_win32(monitor_info, window_info) if capture_method == "win32api" else capture_screen_area_mss(monitor_info, window_info)
                         if frame is not None:
                             # Process with YOLO
                             annotated_frame = process_frame(frame, model, min_confidence, selected_objects)
@@ -484,7 +632,7 @@ def app():
                     
                     while st.session_state.get('screen_capture_running', False):
                         # Capture screen
-                        frame = capture_screen_area(monitor_info, window_info)
+                        frame = capture_screen_area_win32(monitor_info, window_info) if capture_method == "win32api" else capture_screen_area_mss(monitor_info, window_info)
                         
                         if frame is not None:
                             # Process with YOLO
